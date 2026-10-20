@@ -81,6 +81,12 @@ namespace {
         const bool still = m.cpsA[6] == 0xFFC0 && m.cpsA[8] == 0xFFC0 && m.cpsA[10] == 0xFFC0;
         // (the name entry: its maps are not always the same ones, but the game's mode word is 4 on it and the scroll screens
         // are at the board's left edge; in the scene before it, which asks for the name, the word is 4 and they are scrolled)
+        // (the scenes of story between the stages, and the screen of text there: the word is 3, or 0xA4A in the middle
+        // of them, and the scroll screens are at the board's left edge; their maps change from one to the next)
+        if (still && (Ram16(kMode) == 3 || Ram16(kMode) == 0x0A4A)) {
+            name = "story between stages";
+            return Picture::Board;
+        }
         if (still && Ram16(kMode) == 4) {
             name = "name entry";
             return Picture::Board;
@@ -259,6 +265,11 @@ namespace {
         }
         const uint16_t camera = Ram16(kPlane32 + 8), drawnTo = Ram16(kPlane32 + 0x10);
         const int behind = static_cast<int16_t>(camera - drawnTo), down = static_cast<int16_t>(Ram16(kPlane32 + 0x1E));
+        // (the plane's first word is 0x200 for the plane of the floor of the stages the routine was seen to keep right
+        // in; the third stage's has other bits set and the routine draws over the board's own columns there)
+        if (Ram16(kPlane32) != 0x0200) {
+            return;
+        }
         if (std::abs(static_cast<int16_t>(camera - machine.cpsA[10] - 64)) > 8 || behind <= -0x20 || behind >= 0x20 || down <= -0x20 || down >= 0x20) {
             return;
         }
