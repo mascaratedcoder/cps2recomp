@@ -209,10 +209,6 @@ namespace {
             // frames after it are the ones the game writes for this scene)
             const bool restart = screen.before.size() != 0x10000 || changes >= kRestartColumns;
             if (restart) {
-                if (screen.before.size() == 0x10000 && getenv("DDSOM_WIDE_LOG")) {
-                    fprintf(stderr, "widescreen: frame %llu map of screen %d written over (%d columns changed)\n",
-                            static_cast<unsigned long long>(machine.frame), which + 1, changes);
-                }
                 // (a column that was rewritten and has art in it was written for this scene, and is trusted; one that is
                 // one tile all down, the blank the game clears the map to, was not. A column the rewrite did not touch is
                 // what it was: the game wrote it, or did not, as far as this knew before, and a rewrite that leaves a
@@ -364,53 +360,6 @@ void RegisterGame() {
                     const bool inBoard = first <= last ? c >= first && c <= last : c >= first || c <= last;
                     g_screens[which - 1].written[c] = g_screens[which - 1].written[c] && inBoard;
                 }
-            }
-        }
-        // (a log of what the picture was made of, beside settings.ini: for finding out why a screen is not told apart. It
-        // has every change of how the picture is made, and the checksums of the maps and the scroll positions about every
-        // two seconds; for the work on this port, to be left out when it is done)
-        {
-            static FILE *log = [] {
-                std::string path = SettingsPath();
-                const size_t slash = path.find_last_of('/');
-                path = (slash == std::string::npos ? std::string() : path.substr(0, slash + 1)) + "ddsom-widescreen.log";
-                return fopen(path.c_str(), "w");
-            }();
-            static int last = -1;
-            const int now = static_cast<int>(picture) | (screen[0] << 8);
-            if (log && (now != last || machine.frame % 20 == 0)) {
-                // (how many of the added columns each side are not the game's own, for the two scroll screens)
-                int mirrored[2][2] = {};
-                for (int which = 1; which <= 2; which++) {
-                    int first, last;
-                    BoardColumns(machine, which, first, last);
-                    const int across = kSide >> g_screens[which - 1].shift;
-                    for (int d = 1; d <= across; d++) {
-                        mirrored[which - 1][0] += !g_screens[which - 1].written[(first - d) & 63];
-                        mirrored[which - 1][1] += !g_screens[which - 1].written[(last + d) & 63];
-                    }
-                }
-                if (machine.frame % 600 == 0) {
-                    for (int which = 1; which <= 2; which++) {
-                        int first, last;
-                        BoardColumns(machine, which, first, last);
-                        std::string flags;
-                        for (int c = 0; c < 64; c++) {
-                            flags += c == first ? '[' : c == last ? ']' : g_screens[which - 1].written[c] ? 'w' : '.';
-                        }
-                        fprintf(log, "  map %d first %d last %d scroll %04X plane x %d drawn-to %d: %s\n", which + 1, first, last,
-                                machine.cpsA[6 + which * 2], static_cast<int16_t>(Ram16(which == 1 ? kCamera16 : kCamera32)),
-                                static_cast<int16_t>(Ram16((which == 1 ? kCamera16 : kCamera32) + 8)), flags.c_str());
-                    }
-                }
-                fprintf(log, "mirrored left/right 16px %d/%d 32px %d/%d | ", mirrored[0][0], mirrored[0][1], mirrored[1][0], mirrored[1][1]);
-                fprintf(log, "frame %llu %s: %s%s map16 %08X map32 %08X scroll x %04X %04X %04X y %04X %04X %04X mode %04X\n",
-                        static_cast<unsigned long long>(machine.frame),
-                        picture == Picture::Wide ? "wide" : "board's",
-                        screen[0] ? screen : "not told apart", now != last ? " [CHANGE]" : "", MapChecksum(machine, 1), MapChecksum(machine, 2),
-                        machine.cpsA[6], machine.cpsA[8], machine.cpsA[10], machine.cpsA[7], machine.cpsA[9], machine.cpsA[11], Ram16(kMode));
-                fflush(log);
-                last = now;
             }
         }
         // (the title's flame widens the picture a little each frame; anything else is at its width at once)
