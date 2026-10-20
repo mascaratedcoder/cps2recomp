@@ -402,33 +402,77 @@ void Video::RenderLine(int line, uint32_t *out) {
     }
 }
 
-// Pixels that nothing was drawn at (the backdrop's pen), in runs no wider than the added side, take the line's
+// Where the scroll screens drew nothing (`layers`: the screens that may be mirrored, drawn alone), in runs no wider
+// than the added side, the pixels that nothing at all was drawn at (the backdrop's pen in `pens`) take the layers'
 // own picture mirrored at the nearest drawn pixel (or that pixel where the mirror finds nothing). Wider runs are
-// left: a stage that shows the backdrop on purpose shows more of it than that.
-void Video::FillHoles(uint16_t *pens, int width) const {
+// left: a stage that shows the backdrop on purpose shows more of it than that. The runs and what is copied are the
+// layers' alone, so that a panel or a fighter at the edge is neither copied nor smeared across the hole.
+void Video::FillHoles(uint16_t *pens, const uint16_t *layers, int width) const {
     constexpr uint16_t kBackdrop = 0xBFF;
-    uint16_t drawn[kMaxWidth]; // (the line as drawn: what is mirrored)
-    memcpy(drawn, pens, static_cast<size_t>(width) * sizeof(uint16_t));
     for (int start = 0; start < width;) {
-        if (drawn[start] != kBackdrop) {
+        if (layers[start] != kBackdrop) {
             start++;
             continue;
         }
         int end = start;
-        while (end < width && drawn[end] == kBackdrop) {
+        while (end < width && layers[end] == kBackdrop) {
             end++;
         }
         const bool left = start > 0, right = end < width;
         if (end - start <= wide.side && (left || right)) {
             for (int x = start; x < end; x++) {
+                if (pens[x] != kBackdrop) {
+                    continue; // (an object is there)
+                }
                 // (mirrored at the nearer drawn pixel; at the line's ends, the one there is)
                 const bool fromLeft = left && (!right || x - (start - 1) <= end - x);
                 const int edge = fromLeft ? start - 1 : end;
                 const int mirror = 2 * edge - x;
-                pens[x] = mirror >= 0 && mirror < width && drawn[mirror] != kBackdrop ? drawn[mirror] : drawn[edge];
+                pens[x] = mirror >= 0 && mirror < width && layers[mirror] != kBackdrop ? layers[mirror] : layers[edge];
             }
         }
         start = end;
+    }
+}
+
+// One scroll screen's own line (the backdrop's pen where it drew nothing): a run of nothing that reaches an end of the
+// picture and is no wider than the added side takes the screen's picture mirrored at the nearest drawn pixel. A screen
+// that ends where its stage does would otherwise let what is behind it show in the added columns (a floor that stops
+// at the board's edge shows the scenery behind it, a different thing from a hole in the backdrop).
+static void FillScreenEnds(uint16_t *own, uint8_t *marks, uint8_t mark, int width, int side) {
+    constexpr uint16_t kBackdrop = 0xBFF;
+    int first = 0, last = width;
+    while (first < width && own[first] == kBackdrop) {
+        first++;
+    }
+    while (last > first && own[last - 1] == kBackdrop) {
+        last--;
+    }
+    if (first == width) {
+        return; // (nothing drawn on this line at all)
+    }
+    uint16_t drawn[Video::kMaxWidth];
+    memcpy(drawn, own, static_cast<size_t>(width) * sizeof(uint16_t));
+    // (only where the screen is solid from the end of the run for a good way: a post or a rail that happens to be near an
+    // edge on a line the screen is otherwise empty on is not the screen's end, and is not repeated)
+    constexpr int kSolid = 96;
+    int solidFrom = first, solidTo = last;
+    while (solidFrom < width && own[solidFrom] != kBackdrop) {
+        solidFrom++;
+    }
+    while (solidTo > 0 && own[solidTo - 1] != kBackdrop) {
+        solidTo--;
+    }
+    const bool leftSolid = solidFrom - first >= kSolid, rightSolid = last - solidTo >= kSolid;
+    for (int x = 0; leftSolid && x < first && first <= side; x++) {
+        const int mirror = 2 * first - x;
+        own[x] = mirror < width && drawn[mirror] != kBackdrop ? drawn[mirror] : drawn[first];
+        marks[x] |= mark;
+    }
+    for (int x = last; rightSolid && x < width && width - last <= side; x++) {
+        const int mirror = 2 * (last - 1) - x;
+        own[x] = mirror >= 0 && drawn[mirror] != kBackdrop ? drawn[mirror] : drawn[last - 1];
+        marks[x] |= mark;
     }
 }
 
@@ -510,16 +554,49 @@ void Video::RenderLineAs(int line, uint32_t *out) {
         }
     };
     const unsigned order[3] = {l0, l1, l2};
+    // (the pixels a hole is filled from: the scroll screens `wide.fillLayers` names, drawn alone, so that a panel
+    // that is one of the others is not copied into the added columns, and what it covers is what is copied)
+    const bool fill = kWide && wide.fillHoles && wide.side > 0;
+    uint16_t layersOnly[kMaxWidth];
+    uint8_t layersPriority[kMaxWidth];
+    if (fill) {
+        for (int x = 0; x < width; x++) {
+            layersOnly[x] = 0xBFF;
+        }
+        memset(layersPriority, 0, sizeof(layersPriority));
+    }
     for (int n = 0; n < 3; n++) {
-        if (order[n] && enabled(order[n])) {
-            DrawScroll<kWide>(static_cast<int>(order[n]) - 1, rasterLine, pens, priority, static_cast<uint8_t>(1u << n));
+        if (!order[n] || !enabled(order[n])) {
+            continue;
+        }
+        const int which = static_cast<int>(order[n]) - 1;
+        const uint8_t mark = static_cast<uint8_t>(1u << n);
+        if (fill && (wide.fillLayers & (1u << which))) {
+            // (drawn alone, its ends filled, then put over what is behind it)
+            uint16_t own[kMaxWidth];
+            uint8_t ownMarks[kMaxWidth];
+            for (int x = 0; x < width; x++) {
+                own[x] = 0xBFF;
+            }
+            memset(ownMarks, 0, sizeof(ownMarks));
+            DrawScroll<kWide>(which, rasterLine, own, ownMarks, mark);
+            FillScreenEnds(own, ownMarks, mark, width, wide.side);
+            for (int x = 0; x < width; x++) {
+                if (own[x] != 0xBFF) {
+                    pens[x] = own[x];
+                    layersOnly[x] = own[x];
+                }
+                priority[x] |= ownMarks[x];
+            }
+        } else {
+            DrawScroll<kWide>(which, rasterLine, pens, priority, mark);
         }
     }
     if (layerMask & 1) {
         DrawObjects<kWide>(rasterLine, pens, priority, masks);
     }
-    if (kWide && wide.fillHoles && wide.side > 0) {
-        FillHoles(pens, width);
+    if (fill) {
+        FillHoles(pens, layersOnly, width);
     }
     for (int x = 0; x < width; x++) {
         out[x] = m_palette[pens[x]];

@@ -108,13 +108,16 @@ public:
         // the backdrop shows, in the added columns or where a scroll screen is drawn moved: with this set, a
         // run of such pixels no wider than `side` is the line's own picture mirrored at the nearest drawn pixel)
         bool fillHoles = false;
+        // (which scroll screens (bit 0: the 8-pixel one, 1: 16, 2: 32) the line's picture is mirrored from, for a game
+        // whose panel is one of them and must not be copied into the added columns; fillHoles must be set)
+        unsigned fillLayers = 7;
     } wide;
     int Width() const {
         return kWidth + 2 * wide.side;
     }
 
 private:
-    void FillHoles(uint16_t *pens, int width) const;
+    void FillHoles(uint16_t *pens, const uint16_t *layers, int width) const;
     Sources m_src;
     uint32_t m_palette[0xC00] = {};
     uint16_t m_objects[0x1000] = {}; // the latched object list: 1024 entries of four words
