@@ -42,6 +42,10 @@ namespace {
         {0xEFFF368E, 0x19787C52, false, Picture::Wide, "character choice"},
         {0x6423027F, 0x1D204EEA, false, Picture::Board, "story"},
         {0, 0x0D136498, true, Picture::Board, "name entry"},
+        // the opening is the board's (the warning, the story's words, the cave, the dragon: the game's mode word is 0
+        // there) until the flame of the title fills the picture and widens it (see below); the title's own looks are wide
+        {0, 0x8E75098C, false, Picture::Wide, "opening title"},
+        {0, 0x88A341E4, false, Picture::Wide, "title"},
     };
     constexpr uint32_t kMode = 0xFF0D58;
     // The camera's place in a scroll screen's own plane, a word in work RAM for each (0 at a stage's start)
@@ -53,6 +57,28 @@ namespace {
     }
     Picture PictureNow(const Machine &m, const char *&name) {
         const uint32_t map16 = MapChecksum(m, 1), map32 = MapChecksum(m, 2);
+        // (the dragon rising and the flame that ends in the title: the cave's own screen, scrolled up, and then the
+        // maps that follow it; it is the board's, up to where the game's mode word leaves 0 (the title) or the screen is
+        // another)
+        if (map32 == 0xA6A5FFF8 && Ram16(kMode) != 0) {
+            name = "opening title";
+            return Picture::Wide;
+        }
+        static bool dragon = false;
+        if (map32 != 0xA6A5FFF8 || Ram16(kMode) != 0) {
+            dragon = false;
+        } else if (map16 != 0x563BC752 && map16 != 0) {
+            dragon = true;
+        }
+        // (the flame fills the board: from the map the logo's flash is drawn in, the picture grows to the wide one)
+        if (dragon && map16 == 0x4EA29F7B) {
+            name = "opening title";
+            return Picture::Wide;
+        }
+        if (dragon) {
+            name = "opening dragon";
+            return Picture::Board;
+        }
         const bool still = m.cpsA[6] == 0xFFC0 && m.cpsA[8] == 0xFFC0 && m.cpsA[10] == 0xFFC0;
         for (const Known &known : kKnown) {
             if ((!known.map16 || known.map16 == map16) && known.map32 == map32 && (still || !known.onlyStatic)) {
@@ -79,6 +105,44 @@ namespace {
     Screen g_screens[2] = {{4, 4, 16, 1024, {}, {}}, {5, 8, 8, 512, {}, {}}};
     constexpr int kRestartColumns = 24;
     Machine *g_machine = nullptr;
+
+    // The title's flame is drawn in objects (the scroll screens hold the dragon behind it): for the added columns the
+    // objects within a margin's width of the board's edge are drawn again mirrored at that edge, behind the others.
+    void MirrorObjects(uint16_t *list, int &last) {
+        if (!g_machine) {
+            return;
+        }
+        const int regX = g_machine->objectRegs[4];
+        int end = last + 4;
+        for (int i = 0; i <= last && end + 8 <= 0x1000; i += 4) {
+            const uint16_t attr = list[i + 3];
+            // (the flame is in colour sets 16 and up; the words, the logo and the rest at the sides are not repeated)
+            if (list[i + 1] >= 0x8000 || attr >= 0xFF00 || (attr & 0x1F) < 0x10) {
+                continue;
+            }
+            const int offset = attr & 0x80 ? 64 : 64 - regX;
+            const int across = ((attr >> 8) & 0x0F) + 1, width = across * 16;
+            const int at = (list[i] + offset) & 0x3FF;
+            const int raster = at >= 0x200 ? at - 0x400 : at;
+            // (the board's picture is raster columns 64 to 447)
+            for (int edge : {64, 448}) {
+                const int mirrored = 2 * edge - raster - width;
+                const bool inMargin = edge == 64 ? mirrored < edge && mirrored + width > edge - kSide
+                                                 : mirrored + width > edge && mirrored < edge + kSide;
+                const bool near = edge == 64 ? raster < edge + kSide && raster + width > edge
+                                             : raster + width > edge - kSide && raster < edge;
+                if (!near || !inMargin) {
+                    continue;
+                }
+                list[end] = static_cast<uint16_t>((list[i] & ~0x3FF) | ((mirrored - offset) & 0x3FF));
+                list[end + 1] = list[i + 1];
+                list[end + 2] = list[i + 2];
+                list[end + 3] = attr ^ 0x20;
+                end += 4;
+            }
+        }
+        last = end - 4;
+    }
 
     const uint8_t *MapOf(const Machine &m, int which) {
         return &m.videoRam[(static_cast<uint32_t>(m.cpsA[1 + which]) * 256) & ~0x3FFFu & 0x3FFFF];
@@ -267,6 +331,18 @@ void RegisterGame() {
         g_sceneFrames = picture == Picture::Wide && !screen[0] ? g_sceneFrames + 1 : 0;
         DrawAhead(machine);
         WatchMaps(machine);
+        // (the title's flame is the whole picture: what the maps hold outside the board's is the dragon before it, not
+        // a thing to show at the sides, which take the flame's edge, mirrored)
+        if (!strcmp(screen, "opening title")) {
+            for (int which = 1; which <= 2; which++) {
+                int first, last;
+                BoardColumns(machine, which, first, last);
+                for (int c = 0; c < 64; c++) {
+                    const bool inBoard = first <= last ? c >= first && c <= last : c >= first || c <= last;
+                    g_screens[which - 1].written[c] = g_screens[which - 1].written[c] && inBoard;
+                }
+            }
+        }
         // (a log of what the picture was made of, beside settings.ini: for finding out why a screen is not told apart. It
         // has every change of how the picture is made, and the checksums of the maps and the scroll positions about every
         // two seconds; for the work on this port, to be left out when it is done)
@@ -314,13 +390,20 @@ void RegisterGame() {
                 last = now;
             }
         }
-        machine.video.wide.side = FeatureOn("widescreen") && picture != Picture::Board ? kSide : 0;
+        // (the title's flame widens the picture a little each frame; anything else is at its width at once)
+        // (it begins when the flame has filled the board, which takes the first frames of the title's map)
+        static int flameFrames = 0;
+        flameFrames = !strcmp(screen, "opening title") ? flameFrames + 1 : 0;
+        constexpr int kFlameFills = 58, kGrowth = 2;
+        const int grown = flameFrames ? std::clamp((flameFrames - kFlameFills) * kGrowth, 0, +kSide) : picture == Picture::Board ? 0 : kSide;
+        machine.video.wide.side = FeatureOn("widescreen") && picture != Picture::Board ? grown : 0;
         // (where the stage ends short of the wide picture nothing is drawn: the line's own picture is mirrored there)
         machine.video.wide.fillHoles = true;
         // (the panels at the top and bottom are the 8-pixel scroll screen: they are not mirrored into the margins)
         machine.video.wide.fillLayers = 6;
         g_machine = &machine;
         machine.video.wide.tile = machine.video.wide.side ? SideTile : nullptr;
+        machine.video.objectsTaken = machine.video.wide.side && !strcmp(screen, "opening title") ? MirrorObjects : nullptr;
     };
 }
 
