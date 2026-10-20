@@ -6,6 +6,7 @@
 // (enemies, the 8-pixel scroll screen's map, objects it hides beyond the edge) is not there in the added columns
 // until the sources of this game say where it is kept: this is a first look, not a finished feature.
 #include "game.h"
+#include "lift.h"
 #include "machine.h"
 
 #include <zlib.h>
@@ -130,12 +131,17 @@ namespace {
                     fprintf(stderr, "widescreen: frame %llu map of screen %d written over (%d columns changed)\n",
                             static_cast<unsigned long long>(machine.frame), which + 1, changes);
                 }
-                // (a column of the new scene that has art in it was written for it, and is trusted; one that is one tile
-                // all down, the blank the game clears the map to, was not, nor was one it did not touch that the
-                // scene before had no better claim to)
+                // (a column that was rewritten and has art in it was written for this scene, and is trusted; one that is
+                // one tile all down, the blank the game clears the map to, was not. A column the rewrite did not touch is
+                // what it was: the game wrote it, or did not, as far as this knew before, and a rewrite that leaves a
+                // column as it is does not make it any the less the game's)
                 const bool had = screen.before.size() == 0x10000;
                 for (int c = 0; c < 64; c++) {
-                    screen.written[c] = had && changed[c] && !ColumnIsOneTile(screen, map, c);
+                    if (!had) {
+                        screen.written[c] = false;
+                    } else if (changed[c]) {
+                        screen.written[c] = !ColumnIsOneTile(screen, map, c);
+                    }
                 }
             } else {
                 for (int c = 0; c < 64; c++) {
@@ -152,6 +158,51 @@ namespace {
                 }
             }
         }
+    }
+
+
+    // The 32-pixel scroll screen (the floor and what stands on it: fences, mountains) keeps its map up to one column
+    // beyond the board's right edge, where the 16-pixel one keeps three: the picture's added columns would have to copy
+    // a column or two, and a fence or a ridge there would come and go as the camera moves. So, with the widescreen on,
+    // the game's own routine that draws the next column of that screen's map is asked for two more, between frames:
+    // its dispatcher (0x328C0) draws a column on the right while the camera is 32 pixels or more ahead of the place it
+    // has drawn to (the plane's word at +0x1C), so told the camera is 64 pixels further on it draws one or two. Then
+    // all it keeps (the plane's record, the registers, the time) is put back as it was: the game does not know, and
+    // draws the same columns again when it comes to them. Only while the plane is in step with the picture's
+    // scroll register (its place is the register's and 64 more, to a few pixels) and has no work of its own to do.
+    // (frames in a row the picture has been wide and none of the screens told apart by their maps: a stage's scene)
+    int g_sceneFrames = 0;
+    constexpr int kSceneFramesBefore = 60;
+    constexpr uint32_t kPlane32 = 0xFF854E, kPlaneSize = 0x80, kDispatch32 = 0x0328C0;
+    constexpr int kAhead = 0x40;
+    void DrawAhead(Machine &machine) {
+        // (not in the first moments of a scene, nor on a screen of another kind: the plane's record is of the last stage
+        // until the game sets it up again, and drawing from it would write that stage's columns into the other screen's map)
+        if (!FeatureOn("widescreen") || !g_machine || g_sceneFrames < kSceneFramesBefore) {
+            return;
+        }
+        const uint16_t camera = Ram16(kPlane32 + 8), drawnTo = Ram16(kPlane32 + 0x10);
+        const int behind = static_cast<int16_t>(camera - drawnTo), down = static_cast<int16_t>(Ram16(kPlane32 + 0x1E));
+        if (std::abs(static_cast<int16_t>(camera - machine.cpsA[10] - 64)) > 8 || behind <= -0x20 || behind >= 0x20 || down <= -0x20 || down >= 0x20) {
+            return;
+        }
+        M68K &cpu = machine.cpu;
+        const M68K::Kept kept = cpu.Keep();
+        const uint64_t cycles = cpu.cycles;
+        const unsigned busWait = cpu.busWait;
+        const uint32_t pc = cpu.pc;
+        uint8_t record[kPlaneSize];
+        memcpy(record, Ram(kPlane32), kPlaneSize);
+        cpu.busWait = 0;
+        cpu.a[0] = kPlane32;
+        cpu.a[5] = 0xFF8000;
+        SetRam16(kPlane32 + 0x1C, static_cast<uint16_t>(behind + kAhead));
+        Call(cpu, kDispatch32);
+        memcpy(Ram(kPlane32), record, kPlaneSize);
+        cpu.PutBack(kept);
+        cpu.cycles = cycles;
+        cpu.busWait = busWait;
+        cpu.pc = pc;
     }
 
     // What the picture asks (Video::wide.tile) for a tile outside the board's own columns
@@ -209,9 +260,13 @@ void RegisterGame() {
                                   "Experimental: the added columns show only what the game already keeps there.",
                                   kFeatureFirstPage});
     TheGame().beforeFrame = [](Machine &machine) {
-        WatchMaps(machine);
+        g_machine = &machine;
+        // (which screen it is is worked out from the maps as the game left them, before any column is drawn ahead)
         const char *screen = "";
         const Picture picture = PictureNow(machine, screen);
+        g_sceneFrames = picture == Picture::Wide && !screen[0] ? g_sceneFrames + 1 : 0;
+        DrawAhead(machine);
+        WatchMaps(machine);
         // (a log of what the picture was made of, beside settings.ini: for finding out why a screen is not told apart. It
         // has every change of how the picture is made, and the checksums of the maps and the scroll positions about every
         // two seconds; for the work on this port, to be left out when it is done)
@@ -224,7 +279,32 @@ void RegisterGame() {
             }();
             static int last = -1;
             const int now = static_cast<int>(picture) | (screen[0] << 8);
-            if (log && (now != last || machine.frame % 120 == 0)) {
+            if (log && (now != last || machine.frame % 20 == 0)) {
+                // (how many of the added columns each side are not the game's own, for the two scroll screens)
+                int mirrored[2][2] = {};
+                for (int which = 1; which <= 2; which++) {
+                    int first, last;
+                    BoardColumns(machine, which, first, last);
+                    const int across = kSide >> g_screens[which - 1].shift;
+                    for (int d = 1; d <= across; d++) {
+                        mirrored[which - 1][0] += !g_screens[which - 1].written[(first - d) & 63];
+                        mirrored[which - 1][1] += !g_screens[which - 1].written[(last + d) & 63];
+                    }
+                }
+                if (machine.frame % 600 == 0) {
+                    for (int which = 1; which <= 2; which++) {
+                        int first, last;
+                        BoardColumns(machine, which, first, last);
+                        std::string flags;
+                        for (int c = 0; c < 64; c++) {
+                            flags += c == first ? '[' : c == last ? ']' : g_screens[which - 1].written[c] ? 'w' : '.';
+                        }
+                        fprintf(log, "  map %d first %d last %d scroll %04X plane x %d drawn-to %d: %s\n", which + 1, first, last,
+                                machine.cpsA[6 + which * 2], static_cast<int16_t>(Ram16(which == 1 ? kCamera16 : kCamera32)),
+                                static_cast<int16_t>(Ram16((which == 1 ? kCamera16 : kCamera32) + 8)), flags.c_str());
+                    }
+                }
+                fprintf(log, "mirrored left/right 16px %d/%d 32px %d/%d | ", mirrored[0][0], mirrored[0][1], mirrored[1][0], mirrored[1][1]);
                 fprintf(log, "frame %llu %s: %s%s map16 %08X map32 %08X scroll x %04X %04X %04X y %04X %04X %04X mode %04X\n",
                         static_cast<unsigned long long>(machine.frame),
                         picture == Picture::Wide ? "wide" : "board's",
