@@ -43,8 +43,6 @@ namespace {
         {0x6423027F, 0x1D204EEA, false, Picture::Board, "story"},
         {0, 0x0D136498, true, Picture::Board, "name entry"},
         {0, 0xD912A916, false, Picture::Board, "story text between stages"},
-        // the opening is the board's (the warning, the story's words, the cave, the dragon: the game's mode word is 0
-        // there) until the flame of the title fills the picture and widens it (see below); the title's own looks are wide
         {0, 0x8E75098C, false, Picture::Wide, "opening title"},
         {0, 0x88A341E4, false, Picture::Wide, "title"},
     };
@@ -81,6 +79,12 @@ namespace {
             return Picture::Board;
         }
         const bool still = m.cpsA[6] == 0xFFC0 && m.cpsA[8] == 0xFFC0 && m.cpsA[10] == 0xFFC0;
+        // (the name entry: its maps are not always the same ones, but the game's mode word is 4 on it and the scroll screens
+        // are at the board's left edge; in the scene before it, which asks for the name, the word is 4 and they are scrolled)
+        if (still && Ram16(kMode) == 4) {
+            name = "name entry";
+            return Picture::Board;
+        }
         for (const Known &known : kKnown) {
             if ((!known.map16 || known.map16 == map16) && known.map32 == map32 && (still || !known.onlyStatic)) {
                 name = known.name;
