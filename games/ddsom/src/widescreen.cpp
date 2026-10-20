@@ -8,10 +8,13 @@
 #include "game.h"
 #include "machine.h"
 
+#include <zlib.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace cps2recomp {
@@ -19,25 +22,45 @@ namespace cps2recomp {
 namespace {
     constexpr int kSide = Video::kMaxSide;
 
-    // The game's mode, a word in work RAM (found by watching it over a long run of made-up play): 0 in the intro, the
-    // title and the character choice, 0x10 while a stage is played, and 4, 3 and others in the high score entry and the
-    // cutscenes between stages. A second word is 0xFFFF on the character choice and the name entry, the screens laid
-    // out for the board's 384 columns with text and a banner: those are the board's. Every other screen is a scene of
-    // a stage and wide. (That word is also 0xFFFF for a few frames now and then in a stage, counts down from 7 and is 1
-    // on the continue screen: so it is not looked at in a stage, and elsewhere it must stay 0xFFFF for a few frames, so
-    // that a blip does not change the picture's shape.)
-    constexpr uint32_t kMode = 0xFF0D58, kPlainScreen = 0xFF0B38;
-    constexpr uint16_t kModeStage = 0x10, kPlainValue = 0xFFFF;
-    constexpr int kPlainFrames = 6;
-    int g_plainFor = 0;
-    bool WideScreen() {
-        const uint16_t mode = Ram16(kMode);
-        if (mode == kModeStage) {
-            g_plainFor = 0;
-            return true;
+    // How the picture is made: the board's own, or wide.
+    enum class Picture { Board, Wide };
+
+    // The screens that are told apart by what is in their scroll screens' maps (the picture they show is fixed data in
+    // the ROM, so the same in any play): the checksums of the 16-pixel and the 32-pixel screens' maps, found by watching
+    // each of them over a run. The character choice is wide, the story and the name entry are the board's (they are whole
+    // pictures at the board's width, and only repeat when made wider). Any other screen is wide but for the intro and the
+    // title, which a word of the game's (work RAM FF0D58) keeps at the board's: it is 0 there and takes other values later
+    // in a play, so it is only ever looked at to keep a screen narrow that these two are.
+    struct Known {
+        uint32_t map16, map32; // (map16 0: any: the screen's 16-pixel map is not always the same)
+        bool onlyStatic; // only while the three scroll screens are at the board's left edge (not scrolled)
+        Picture picture;
+        const char *name;
+    };
+    constexpr Known kKnown[] = {
+        {0xEFFF368E, 0x19787C52, false, Picture::Wide, "character choice"},
+        {0x6423027F, 0x1D204EEA, false, Picture::Board, "story"},
+        {0, 0x0D136498, true, Picture::Board, "name entry"},
+    };
+    constexpr uint32_t kMode = 0xFF0D58;
+    // The camera's place in a scroll screen's own plane, a word in work RAM for each (0 at a stage's start)
+    constexpr uint32_t kCamera16 = 0xFF850E, kCamera32 = 0xFF85AE;
+
+    uint32_t MapChecksum(const Machine &m, int which) {
+        const uint8_t *map = &m.videoRam[(static_cast<uint32_t>(m.cpsA[1 + which]) * 256) & ~0x3FFFu & 0x3FFFF];
+        return static_cast<uint32_t>(crc32(0, map, 0x4000));
+    }
+    Picture PictureNow(const Machine &m, const char *&name) {
+        const uint32_t map16 = MapChecksum(m, 1), map32 = MapChecksum(m, 2);
+        const bool still = m.cpsA[6] == 0xFFC0 && m.cpsA[8] == 0xFFC0 && m.cpsA[10] == 0xFFC0;
+        for (const Known &known : kKnown) {
+            if ((!known.map16 || known.map16 == map16) && known.map32 == map32 && (still || !known.onlyStatic)) {
+                name = known.name;
+                return known.picture;
+            }
         }
-        g_plainFor = Ram16(kPlainScreen) == kPlainValue ? g_plainFor + 1 : 0;
-        return mode != 0 && g_plainFor < kPlainFrames;
+        name = "";
+        return Ram16(kMode) == 0 ? Picture::Board : Picture::Wide;
     }
 
     // The scroll screens of 16 and 32 pixels' tiles have maps of 64 columns, and the game writes into them only what its
@@ -53,7 +76,7 @@ namespace {
         bool written[64] = {};
     };
     Screen g_screens[2] = {{4, 4, 16, 1024, {}, {}}, {5, 8, 8, 512, {}, {}}};
-    int g_modeBefore = -1;
+    constexpr int kRestartColumns = 24;
     Machine *g_machine = nullptr;
 
     const uint8_t *MapOf(const Machine &m, int which) {
@@ -66,28 +89,60 @@ namespace {
         last = ((scrollX + kSide + Video::kWidth - 1) >> shift) & 63;
     }
 
+    // Whether a column of a map is one tile all down (what clearing the map writes)
+    bool ColumnIsOneTile(const Screen &screen, const uint8_t *map, int column) {
+        const uint8_t *first = &map[static_cast<size_t>(column) * screen.entries * 4];
+        for (int g = 0; g < screen.groups; g++) {
+            const uint8_t *at = &map[(static_cast<size_t>(column) * screen.entries + static_cast<size_t>(g) * screen.stride) * 4];
+            for (int e = 0; e < screen.entries; e++) {
+                if (memcmp(at + e * 4, first, 4)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
     void WatchMaps(Machine &machine) {
-        const int mode = Ram16(kMode);
-        const bool restart = mode != g_modeBefore;
-        g_modeBefore = mode;
         for (int which = 1; which <= 2; which++) {
             Screen &screen = g_screens[which - 1];
             const uint8_t *map = MapOf(machine, which);
             const size_t columnBytes = static_cast<size_t>(screen.entries) * 4;
-            if (restart || screen.before.size() != 0x10000) {
-                screen.before.assign(map, map + 0x10000);
-                std::fill(std::begin(screen.written), std::end(screen.written), false);
-            } else {
+            bool changed[64] = {};
+            int changes = 0;
+            if (screen.before.size() == 0x10000) {
                 for (int c = 0; c < 64; c++) {
                     for (int g = 0; g < screen.groups; g++) {
                         const size_t at = (static_cast<size_t>(c) * screen.entries + static_cast<size_t>(g) * screen.stride) * 4;
                         if (memcmp(&screen.before[at], &map[at], columnBytes)) {
-                            screen.written[c] = true;
-                            memcpy(&screen.before[at], &map[at], columnBytes);
+                            changed[c] = true;
                         }
                     }
+                    changes += changed[c];
                 }
             }
+            // (a scene begins with the screen's map written over, nearly all of it at once: what was learned of the
+            // one before is of no use. A frame that changes this much starts again; the columns that change from the
+            // frames after it are the ones the game writes for this scene)
+            const bool restart = screen.before.size() != 0x10000 || changes >= kRestartColumns;
+            if (restart) {
+                if (screen.before.size() == 0x10000 && getenv("DDSOM_WIDE_LOG")) {
+                    fprintf(stderr, "widescreen: frame %llu map of screen %d written over (%d columns changed)\n",
+                            static_cast<unsigned long long>(machine.frame), which + 1, changes);
+                }
+                // (a column of the new scene that has art in it was written for it, and is trusted; one that is one tile
+                // all down, the blank the game clears the map to, was not, nor was one it did not touch that the
+                // scene before had no better claim to)
+                const bool had = screen.before.size() == 0x10000;
+                for (int c = 0; c < 64; c++) {
+                    screen.written[c] = had && changed[c] && !ColumnIsOneTile(screen, map, c);
+                }
+            } else {
+                for (int c = 0; c < 64; c++) {
+                    screen.written[c] = screen.written[c] || changed[c];
+                }
+            }
+            screen.before.assign(map, map + 0x10000);
             int first, last;
             BoardColumns(machine, which, first, last);
             for (int c = first;; c = (c + 1) & 63) {
@@ -106,21 +161,31 @@ namespace {
         }
         const Machine &m = *g_machine;
         Screen &screen = g_screens[which - 1];
-        if (screen.written[column]) {
-            return false;
-        }
         int first, last;
         BoardColumns(m, which, first, last);
-        // (how far from the board's picture the column is, on its side, and the column the written ones end at there)
+        const bool leftSide = at < kSide;
+        // (the columns left of the board are of the stage only as far as the camera is from the stage's left end: at its
+        // very start the game has written there what its plan has before the stage, which is other pictures. So only so
+        // many of them are trusted: the camera's place, the word the game keeps for the screen's plane, over the tile's width)
+        const int tileWidth = 1 << screen.shift;
+        const int trusted = std::min<int>(Ram16(which == 1 ? kCamera16 : kCamera32) / tileWidth, 8);
+        auto good = [&](int c) {
+            const int away = (first - c) & 63; // (columns to the left of the board's first: 1, 2...)
+            return screen.written[c] && !(leftSide && away >= 1 && away <= 8 && away > trusted);
+        };
+        if (good(column)) {
+            return false;
+        }
+        // (how far from the board's picture the column is, on its side, and the column the good ones end at there)
         int edge, step;
-        if (at < kSide) {
+        if (leftSide) {
             edge = first;
             step = -1;
         } else {
             edge = last;
             step = 1;
         }
-        for (int n = 0; n < 8 && screen.written[(edge + step) & 63]; n++) {
+        for (int n = 0; n < 8 && good((edge + step) & 63); n++) {
             edge = (edge + step) & 63;
         }
         const int distance = ((column - edge) * step) & 63; // 1 at the first column that was not written
@@ -145,18 +210,31 @@ void RegisterGame() {
                                   kFeatureFirstPage});
     TheGame().beforeFrame = [](Machine &machine) {
         WatchMaps(machine);
-        const bool wideNow = WideScreen(); // (once a frame: it counts)
-        if (static const bool log = getenv("DDSOM_WIDE_LOG") != nullptr; log) {
-            // (for finding out why the picture changes shape: every change of the two words that decide it)
-            static unsigned last = ~0u;
-            const unsigned now = (Ram16(kMode) << 16) | Ram16(kPlainScreen);
-            if (now != last) {
-                fprintf(stderr, "widescreen: frame %llu mode %04X word %04X: %s\n", static_cast<unsigned long long>(machine.frame),
-                        Ram16(kMode), Ram16(kPlainScreen), wideNow ? "wide" : "board's");
+        const char *screen = "";
+        const Picture picture = PictureNow(machine, screen);
+        // (a log of what the picture was made of, beside settings.ini: for finding out why a screen is not told apart. It
+        // has every change of how the picture is made, and the checksums of the maps and the scroll positions about every
+        // two seconds; for the work on this port, to be left out when it is done)
+        {
+            static FILE *log = [] {
+                std::string path = SettingsPath();
+                const size_t slash = path.find_last_of('/');
+                path = (slash == std::string::npos ? std::string() : path.substr(0, slash + 1)) + "ddsom-widescreen.log";
+                return fopen(path.c_str(), "w");
+            }();
+            static int last = -1;
+            const int now = static_cast<int>(picture) | (screen[0] << 8);
+            if (log && (now != last || machine.frame % 120 == 0)) {
+                fprintf(log, "frame %llu %s: %s%s map16 %08X map32 %08X scroll x %04X %04X %04X y %04X %04X %04X mode %04X\n",
+                        static_cast<unsigned long long>(machine.frame),
+                        picture == Picture::Wide ? "wide" : "board's",
+                        screen[0] ? screen : "not told apart", now != last ? " [CHANGE]" : "", MapChecksum(machine, 1), MapChecksum(machine, 2),
+                        machine.cpsA[6], machine.cpsA[8], machine.cpsA[10], machine.cpsA[7], machine.cpsA[9], machine.cpsA[11], Ram16(kMode));
+                fflush(log);
                 last = now;
             }
         }
-        machine.video.wide.side = FeatureOn("widescreen") && wideNow ? kSide : 0;
+        machine.video.wide.side = FeatureOn("widescreen") && picture != Picture::Board ? kSide : 0;
         // (where the stage ends short of the wide picture nothing is drawn: the line's own picture is mirrored there)
         machine.video.wide.fillHoles = true;
         // (the panels at the top and bottom are the 8-pixel scroll screen: they are not mirrored into the margins)
