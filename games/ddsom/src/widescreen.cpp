@@ -113,6 +113,9 @@ namespace {
 
     // The title's flame is drawn in objects (the scroll screens hold the dragon behind it): for the added columns the
     // objects within a margin's width of the board's edge are drawn again mirrored at that edge, behind the others.
+    // (and the burning village's flames along the horizon, which the game puts only inside the board's picture: their
+    // tiles are one run of the graphics)
+    bool g_titleFlame = false;
     void MirrorObjects(uint16_t *list, int &last) {
         if (!g_machine) {
             return;
@@ -121,8 +124,12 @@ namespace {
         int end = last + 4;
         for (int i = 0; i <= last && end + 8 <= 0x1000; i += 4) {
             const uint16_t attr = list[i + 3];
-            // (the flame is in colour sets 16 and up; the words, the logo and the rest at the sides are not repeated)
-            if (list[i + 1] >= 0x8000 || attr >= 0xFF00 || (attr & 0x1F) < 0x10) {
+            if (list[i + 1] >= 0x8000 || attr >= 0xFF00) {
+                continue;
+            }
+            // (the title's flame is in colour sets 16 and up; the words, the logo and the rest at the sides are not repeated)
+            const uint32_t code = list[i + 2];
+            if (g_titleFlame ? (attr & 0x1F) < 0x10 : code < 0xBD00 || code > 0xBEFF || (attr & 0x1F) != 0x1D) {
                 continue;
             }
             const int offset = attr & 0x80 ? 64 : 64 - regX;
@@ -408,7 +415,8 @@ void RegisterGame() {
         machine.video.wide.fillLayers = 6;
         g_machine = &machine;
         machine.video.wide.tile = machine.video.wide.side ? SideTile : nullptr;
-        machine.video.objectsTaken = machine.video.wide.side && !strcmp(screen, "opening title") ? MirrorObjects : nullptr;
+        g_titleFlame = !strcmp(screen, "opening title");
+        machine.video.objectsTaken = machine.video.wide.side == kSide || g_titleFlame ? MirrorObjects : nullptr;
     };
 }
 
