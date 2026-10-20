@@ -42,6 +42,7 @@ namespace {
         {0xEFFF368E, 0x19787C52, false, Picture::Wide, "character choice"},
         {0x6423027F, 0x1D204EEA, false, Picture::Board, "story"},
         {0, 0x0D136498, true, Picture::Board, "name entry"},
+        {0, 0xD912A916, false, Picture::Board, "story text between stages"},
         // the opening is the board's (the warning, the story's words, the cave, the dragon: the game's mode word is 0
         // there) until the flame of the title fills the picture and widens it (see below); the title's own looks are wide
         {0, 0x8E75098C, false, Picture::Wide, "opening title"},
