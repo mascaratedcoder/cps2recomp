@@ -452,7 +452,7 @@ static void FillScreenEnds(uint16_t *own, uint8_t *marks, uint8_t mark, int widt
         return; // (nothing drawn on this line at all)
     }
     uint16_t drawn[Video::kMaxWidth];
-    memcpy(drawn, own, static_cast<size_t>(width) * sizeof(uint16_t));
+    memcpy(drawn, own, static_cast<size_t>(std::clamp(width, 0, +Video::kMaxWidth)) * sizeof(uint16_t));
     // (only where the screen is solid from the end of the run for a good way: a post or a rail that happens to be near an
     // edge on a line the screen is otherwise empty on is not the screen's end, and is not repeated)
     constexpr int kSolid = 96;
